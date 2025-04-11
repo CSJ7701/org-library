@@ -17,14 +17,26 @@
   "Property used to identify each book uniquely."
   :type 'string)
 
-(defcustom org-library-default-tags '("have" "want" "read")
-  "Default tags offered when adding new books."
+(defcustom org-library-tags-property "LibraryTags"
+  "Property used to stoer book tags, separated by commas."
+  :type 'string)
+
+(defcustom org-library-id-generator #'org-id-new
+  "Function used to generate IDs for new book entries."
+  :type 'function)
+
+(defcustom org-library-required-properties '("ID")
+  "Properties that must exist for a book entry."
   :type '(repeat string))
 
-(defcustom org-library-book-entry-template
-  '((:title) (:author) (:year) (:publisher))
-  "Template controlling which properties are prompted for or displayed."
-  :type '(repeat symbol))
+(defcustom org-library-default-properties '("Author" "Status")
+  "Properties automatically added to new book entries."
+  :type '(repeat string))
+
+(defcustom org-library-supported-properties
+  '("Author" "Genre" "Status" "Series" "Pages" "ISBN" "Publisher" "Year" "LibraryTags")
+  "All properties that org-library recognizes and provides completion for."
+  :type '(repeat string))
 
 (defcustom org-library-fetch-metadata-function #'org-library-fetch-openlibrary
   "Function to fetch metadata for a given ISBN."
@@ -35,10 +47,19 @@
   "List of all metadata functions."
   :type '(repeat function))
 
-(defcustom org-library-fetch-metadata-fields
-  '(("Field" . "JSON_key"))
-  "Fields to fetch from api response."
-  :type '(repeat symbol))
+(defcustom org-library-display-function #'org-library--display-results-tabulated
+  "Function to display book results.
+The function should accept a list of book alists as its argument."
+  :type 'function)
+
+(defcustom org-library-display-functions
+  "List of all display functions."
+  '(#'org-library--display-results-org #'org-library--display-results-tabulated)
+  :type '(repeat function))
+
+(defcustom org-library-tag-separator ","
+  "Separator used when storing multiple values in the tags property."
+  :type 'string)
 
 
 ;; === Commands ===
@@ -51,6 +72,38 @@
       (insert "#+PROPERTY: header-args :exports both\n")
       (save-buffer)
       (message "Created new library file at %s" org-library-file))))
+
+(defun org-library-add-book (&optional isbn)
+  "Add a new book to the library.
+If ISBN provided, fetch metadata from configured sources."
+  (interactive)
+  (org-library-initialize)
+  (with-current-buffer (find-file-noselect org-library-file)
+    (goto-char (point-max))
+    (let* ((metadata (when isbn (org-library-fetch-metadata isbn)))
+	   (title (or (and metadata (alist-get :title metadata))
+		      (read-string "Title: "))))
+      ;; Insert headline
+      (insert (format "\n* %s\n" title))
+      (org-back-to-heading)
+      (org-insert-property-drawer)
+      ;; Generate and add ID
+      (let ((id (funcall org-library-id-generator)))
+	(org-set-property org-library-id-property id))
+      ;; Add default properties with values from metadata or "unknown"
+      (dolist (prop org-library-default-properties)
+	(let* ((prop-key (intern (concat ":" (downcase prop))))
+	       (value (or (and metadata (alist-get prop-key metadata)) "unknown")))
+	  (org-set-property prop value)))
+      ;; Add additional metadata properties if available
+      (when metadata
+	(dolist (item metadata)
+	  (let ((prop-name (substring (symbol-name (car item)) 1)))
+	    (when (and (not (string= prop-name "title"))
+		       (member (capitalize prop-name) org-library-supported-properties))
+	      (org-set-property (capitalize prop-name) (cdr item))))))
+	(save-buffer)
+	(message "Added book: %s" title))))
 
 (defun org-library-remove-book ()
   "Remove a book from the library after confirmation"
@@ -67,32 +120,62 @@
 	(save-buffer)
 	(message "Book removed: %s" selected)))))
 
-;; Search
-;; Want to generalize in the future.
-;; Search fields are too static currently.
+(defun org-library-edit-property ()
+  "Edit a property of the current book entry."
+  (interactive)
+  (let* ((prop (completing-read "Property: " org-library-supported-properties nil t))
+	 (current-val (org-entry-get (point) prop))
+	 (new-val (read-string (format "%s: " prop) current-val)))
+    (org-set-property prop new-val)
+    (message "Updated %s to '%s'" prop new-val)))
+
 (defun org-library-search (&optional property value)
   "Search for books in the library.
 If PROPERTY and VALUE are provided, search for books with matching property."
   (interactive)
-  (let* ((props '("Any" "Title" "Author" "ISBN" "Publisher" "Year"))
+  (let* ((props (cons "Any" (cons "Title" org-library-supported-properties)))
 	 (prop (if property property
 		  (completing-read "Search by property: " props nil t)))
 	 (val (if value value
 		(read-string (format "Search for %s: " (downcase prop)))))
 	 (results (org-library--search prop val)))
     (if (called-interactively-p 'any)
-	(org-library--display-results results)
+	(funcall org-library-display-function results)
       results)))
 
-;; List all books (tabulated list mode?)
+(defun org-library-add-tag (tag)
+  "Add TAG to current book entry."
+  (interactive (list (completing-read "Tag: " (org-library--get-all-tags) nil nil)))
+  (let* ((current (org-entry-get (point) org-library-tags-property))
+	 (tags (when current (split-string current org-library-tag-separator)))
+	 (new-tags (if (member tag tags) tags (cons tag tags)))
+	 (tag-string (mapconcat #'identity new-tags org-library-tag-separator)))
+    (org-set-property org-library-tags-property tag-string)
+    (message "Tags: %s" tag-string)))
+
+(defun org-library-remove-tag (tag)
+  "Remove TAG from the current book entry."
+  (interactive
+   (list (let ((current-tags (split-string
+			      (or (org-entry-get (point) org-library-tags-property) "")
+			      org-library-tag-separator)))
+	   (completing-read "Remove tag: " current-tags nil t))))
+  (let* ((current (org-entry-get (point) org-library-tags-property))
+	 (tags (when current (split-string current org-library-tag-separator)))
+	 (new-tags (remove tag tags))
+	 (tag-string (mapconcat #'identity new-tags org-library-tag-separator)))
+    (if (string-empty-p tag-string)
+	(org-delete-property org-library-tags-property)
+      (org-set-property org-library-tags-property tag-string))
+    (message "Tags: %s" (or tag-string "none"))))
+   
+
 (defun org-library-list ()
   "Display a list of all books in the library."
   (interactive)
   (let ((books (org-library--get-all-books)))
-    (org-library--display-results books)))
+    (funcall org-library-display-function books)))
 
-;; Metadata (requires ISBN)
-;; ;; Fetch from specified endpoint, if called with universal argument, prompt for endpoint using list of all metadata functions
 (defun org-library-fetch-metadata (isbn)
   "Fetch metadata for a book with ISBN."
   (interactive "sISBN: ")
@@ -130,6 +213,8 @@ If PROPERTY and VALUE are provided, search for books with matching property."
     (message "Library exported to %s" output-file)))
 
 ;; === Metadata ===
+;; Metadata fetchers should return an alist of property-value pairs.
+;; Properties should be a member of 'org-library-supported-properties'.
 
 (defun org-library-fetch-openlibrary (isbn)
   "Fetch book metadata from OpenLibrary API for ISBN."
@@ -172,9 +257,10 @@ Each book is represented as an alist of properties."
 (defun org-library--search (property value)
   "Search for books with PROPERTY matching VALUE."
   (let ((books (org-library--get-all-books))
-	(property-key (if (string= property "Any")
-			  nil
-			(intern (concat ":" (downcase property))))))
+	(property-key (cond
+		       ((string= property "Any") nil)
+		       ((string= property "Title") :title)
+		       (t (intern (concat ":" (downcase property)))))))
     (seq-filter
      (lambda (book)
        (if property-key
@@ -186,8 +272,22 @@ Each book is represented as an alist of properties."
 		   book)))
      books)))
 
-;; Tabulated list mode for more functionality?
-(defun org-library--display-results (results)
+(defun org-library--get-all-tags ()
+  "Get a list of all tags used in the library."
+  (let ((books (org-library--get-all-books))
+	(tags '()))
+    (dolist (book books)
+      (let* ((tag-key (intern (concat ":" (downcase org-library-tags-property))))
+	     (book-tags (alist-get tag-key book)))
+	(when book-tags
+	  (dolist (tag (split-string book-tags org-library-tag-separator))
+	    (unless (string-empty-p (string-trim tag))
+	      (push (string-trim tag) tags))))))
+    (seq-uniq tags)))
+
+;; === Display Functions ===
+
+(defun org-library--display-results-org (results)
   "Display search RESULTS in a buffer."
   (with-current-buffer (get-buffer-create "*Org Library Results*")
     (let ((inhibit-read-only t))
@@ -208,8 +308,41 @@ Each book is represented as an alist of properties."
     (goto-char (point-min))
     (display-buffer (current-buffer))))
 
+(defun org-library--display-results-tabulated (results)
+  "Display RESULTS in a tabulated list buffer."
+  (let ((buffer (get-buffer-create "*Org Library Results*")))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (tabulated-list-mode)
+        ;; Determine which columns to display based on available properties
+        (let* ((all-props (seq-uniq
+                          (mapcan (lambda (book)
+                                    (mapcar #'car book))
+                                  results)))
+               (display-props (seq-filter (lambda (prop)
+                                           (memq prop '(:title :author :genre :status)))
+                                         all-props))
+               (cols (mapcar (lambda (prop)
+                               (list (substring (symbol-name prop) 1)
+                                     10 'identity))
+                             display-props)))
+          (setq tabulated-list-format (vconcat cols))
+          (setq tabulated-list-entries
+                (mapcar (lambda (book)
+                          (let ((id (or (alist-get :id book) "unknown"))
+                                (values (mapcar (lambda (prop)
+                                                 (or (alist-get prop book) ""))
+                                               display-props)))
+                            (list id (vconcat values))))
+                        results)))
+        (tabulated-list-init-header)
+        (tabulated-list-print t)))
+    (display-buffer buffer)))
+
 ;; TODO
-;;    1. Generalize the property setup. Currently, we hardcode the properties we want from the api, export, and search by.
-;;       We should allow some level of customizablility there.
-;;    2. Generalize the 'export' functionality. We should implement something similar to the metadata fetching, where we call a formatter function.
-;;    3. Improve the 'list' functionality. Creating an org-mode list is somewhat useless. We might as well just open the library org file.
+;;    1. Allow interactive display function selection with universal argument
+;;    2. Improve metadata fetching setup. Dedicated function to fetch metadata interactively
+;;    3. Allow interactive metadata function selection with universal argument for that interactive metadat function described above
+;;    4. Generalize the 'export' functionality. We should implement something similar to the metadata fetching, where we call a formatter function. I'm thinking we define an alist that maps from format name to formatter function, and allow the user to select from that list when calling the 'export' function.
+
