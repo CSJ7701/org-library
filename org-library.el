@@ -5,6 +5,8 @@
 
 ;; === Variables ===
 
+(defvar org-library--index nil "In-memory index of books.")
+
 (defgroup org-library nil
   "Personal library tracking system for Org-mode."
   :group 'org)
@@ -34,7 +36,7 @@
   :type '(repeat string))
 
 (defcustom org-library-supported-properties
-  '("Author" "Genre" "Status" "Series" "Pages" "ISBN" "Publisher" "Year" "LibraryTags")
+  '("Author" "Genre" "Status" "Series" "Pages" "Isbn" "Asin" "Publisher" "Year" "LibraryTags")
   "All properties that org-library recognizes and provides completion for."
   :type '(repeat string))
 
@@ -43,7 +45,7 @@
   :type 'function)
 
 (defcustom org-library-fetch-metadata-functions
-  '(#'org-library-fetch-openlibrary)
+  '(org-library-fetch-openlibrary)
   "List of all metadata functions."
   :type '(repeat function))
 
@@ -53,14 +55,31 @@ The function should accept a list of book alists as its argument."
   :type 'function)
 
 (defcustom org-library-display-functions
+  '(org-library--display-results-org org-library--display-results-tabulated)
   "List of all display functions."
-  '(#'org-library--display-results-org #'org-library--display-results-tabulated)
   :type '(repeat function))
+
+(defcustom org-library-export-functions
+  '(("csv" . org-library--export-csv)
+    ("json" . org-library--export-json))
+  "Alist mapping export format names to formatter functions."
+  :type '(alist :key-type string :value-type function))
 
 (defcustom org-library-tag-separator ","
   "Separator used when storing multiple values in the tags property."
   :type 'string)
 
+;; === Hooks ===
+
+(defcustom org-library-validation-hook nil
+  "Hook run while validating a book entry.
+Each function in the hook should accept a single argument: an alist of book properties.
+If any function returns nil, the save is aborted."
+  :type 'hook
+  :group 'org-library)
+(add-hook 'org-library-validation-hook #'org-library--validate-required-properties)
+(add-hook 'org-library-validation-hook #'org-library--validate-unique-isbn)
+(add-hook 'org-library-validation-hook #'org-library--validate-unique-title-author)
 
 ;; === Commands ===
 (defun org-library-initialize ()
@@ -78,32 +97,18 @@ The function should accept a list of book alists as its argument."
 If ISBN provided, fetch metadata from configured sources."
   (interactive)
   (org-library-initialize)
-  (with-current-buffer (find-file-noselect org-library-file)
-    (goto-char (point-max))
-    (let* ((metadata (when isbn (org-library-fetch-metadata isbn)))
-	   (title (or (and metadata (alist-get :title metadata))
-		      (read-string "Title: "))))
-      ;; Insert headline
-      (insert (format "\n* %s\n" title))
-      (org-back-to-heading)
-      (org-insert-property-drawer)
-      ;; Generate and add ID
-      (let ((id (funcall org-library-id-generator)))
-	(org-set-property org-library-id-property id))
-      ;; Add default properties with values from metadata or "unknown"
-      (dolist (prop org-library-default-properties)
-	(let* ((prop-key (intern (concat ":" (downcase prop))))
-	       (value (or (and metadata (alist-get prop-key metadata)) "unknown")))
-	  (org-set-property prop value)))
-      ;; Add additional metadata properties if available
-      (when metadata
-	(dolist (item metadata)
-	  (let ((prop-name (substring (symbol-name (car item)) 1)))
-	    (when (and (not (string= prop-name "title"))
-		       (member (capitalize prop-name) org-library-supported-properties))
-	      (org-set-property (capitalize prop-name) (cdr item))))))
-	(save-buffer)
-	(message "Added book: %s" title))))
+  (let* ((metadata (when isbn (org-library--fetch-metadata isbn)))
+	 (title (or (and metadata (alist-get :title metadata))
+		    (read-string "Title: ")))
+	 (book-data (append
+		     `((:title . ,title))
+		     (when isbn
+		       `((:isbn . ,(format "%s" isbn))))
+		     (when metadata metadata))))
+    (let ((result (org-library--add-book book-data)))
+      (if result
+	  (message "Added book: %s" title)
+	(message "Failed to add book: %s" title)))))
 
 (defun org-library-remove-book ()
   "Remove a book from the library after confirmation"
@@ -129,18 +134,24 @@ If ISBN provided, fetch metadata from configured sources."
     (org-set-property prop new-val)
     (message "Updated %s to '%s'" prop new-val)))
 
-(defun org-library-search (&optional property value)
+(defun org-library-search (&optional property value prefix)
   "Search for books in the library.
-If PROPERTY and VALUE are provided, search for books with matching property."
-  (interactive)
-  (let* ((props (cons "Any" (cons "Title" org-library-supported-properties)))
-	 (prop (if property property
-		  (completing-read "Search by property: " props nil t)))
-	 (val (if value value
-		(read-string (format "Search for %s: " (downcase prop)))))
-	 (results (org-library--search prop val)))
+If PROPERTY and VALUE are provided, search for books with matching property.
+With PREFIX argument (C-u), prompt for the display function to use."
+  (interactive
+   (list (completing-read "Search by property: "
+			  (cons "Any" (cons "Title" org-library-supported-properties))
+			  nil t)
+	 (read-string "Search for value: ")
+	 current-prefix-arg))
+  (let* ((results (org-library--search property value))
+	 (display-fn (if prefix
+			 (intern (completing-read "Display function: "
+						  (mapcar #'symbol-name org-library-display-functions)
+						  nil t))
+		       org-library-display-function)))
     (if (called-interactively-p 'any)
-	(funcall org-library-display-function results)
+	(funcall display-fn results)
       results)))
 
 (defun org-library-add-tag (tag)
@@ -169,73 +180,157 @@ If PROPERTY and VALUE are provided, search for books with matching property."
       (org-set-property org-library-tags-property tag-string))
     (message "Tags: %s" (or tag-string "none"))))
    
+(defun org-library-list (&optional prefix)
+  "Display a list of books in the library.
+With PREFIX (C-u), prompt for the display function to use."
+  (interactive "P")
+  (let* ((books (org-library--get-all-books))
+	 (display-fn (if prefix
+			 (intern (completing-read "Display function: "
+						  (mapcar #'symbol-name org-library-display-functions)
+						  nil t))
+		       org-library-display-function)))
+    (funcall display-fn books)))
+  
+(defun org-library-fetch-metadata (&optional prefix)
+  "Fetch/update metadata for book at point using ISBN property.
+With PREFIX argument (C-u), prompt for the metadata function to use."
+  (interactive "P")
+  (unless (org-at-heading-p)
+    (user-error "Not on a book heading"))
 
-(defun org-library-list ()
-  "Display a list of all books in the library."
-  (interactive)
-  (let ((books (org-library--get-all-books)))
-    (funcall org-library-display-function books)))
+  (let ((isbn (org-entry-get (point) "ISBN")))
+    (unless isbn
+      (user-error "No ISBN property found for this book"))
 
-(defun org-library-fetch-metadata (isbn)
-  "Fetch metadata for a book with ISBN."
-  (interactive "sISBN: ")
-  (let ((metadata (funcall org-library-fetch-metadata-function isbn)))
-    (if metadata
-	(message "Found %s by %s"
-		 (alist-get :title metadata)
-		 (alist-get :author metadata))
-      (message "No metadata found for ISBN %s" isbn))
-    metadata))
+    (let* ((fetch-fn (if prefix
+			 (intern (completing-read "Metadata source: "
+						  (mapcar #'symbol-name org-library-fetch-metadata-functions)
+						  nil t))
+		       org-library-fetch-metadata-function))
+	   (metadata (org-library--fetch-metadata isbn fetch-fn)))
+      (when metadata
+	(dolist (item metadata)
+	  (let ((prop-name (substring (symbol-name (car item)) 1)))
+	    (when (and (not (string= prop-name "title")) ;; Don't overwrite title
+		       (member (capitalize prop-name) org-library-supported-properties))
+	      (org-set-property (capitalize prop-name) (cdr item)))))
+	(message "Updated metadata for '%s'" (substring-no-properties (org-get-heading t t t t)))))))
 
-;; Export
-;; ;; CSV, JSON, others?
-;; Generalize in the future using dedicated export functions, similar to metadata approach
-(defun org-library-export (format)
-  "Export library in specified format (csv or json)."
-  (interactive (list (completing-read "Export format: " '("csv" "json") nil t)))
-  (let ((books (org-library--get-all-books))
-	(output-file (read-file-name "Export to: " nil nil nil
-				     (format "library.%s" format))))
-    (with-temp-file output-file
-      (cond
-       ((string= format "csv")
-	(insert "Title,Author,ISBN,Publisher,Year\n")
-	(dolist (book books)
-	  (insert (format "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n"
-			  (alist-get :title book "")
-			  (alist-get :author book "")
-			  (alist-get :isbn book "")
-			  (alist-get :publisher book "")
-			  (alist-get :year book "")))))
-       ((string= format "json")
-	(require 'json)
-	(insert (json-encode books)))))
+(defun org-library-bulk-import (books-list &optional skip-existing)
+  "Import multiple books from BOOKS-LIST.
+Each item in the list should be a book-data alist.
+If SKIP-EXISTING is non-nil, silently skip books that would cause duplicate ISBN or ID errors."
+  (let ((success-count 0)
+	(skip-count 0)
+	(error-count 0))
+    (dolist (book books-list)
+      (condition-case err
+	  (let* ((isbn (alist-get :isbn book))
+		 (exists (and isbn
+			      (not (string-empty-p isbn))
+			      (org-library--search "ISBN" isbn))))
+	    (if (and exists skip-existing)
+		(progn
+		  (message "Skipping existing book: %s" (alist-get :title book))
+		  (cl-incf skip-count))
+		;; Try to add book
+		(if (org-library--add-book book)
+		    (cl-incf success-count)
+		  (cl-incf error-count))))
+	;; Catch any errors
+	(error
+	 (message "Error adding book '%s': %s"
+		  (alist-get :title book)
+		  (error-message-string err))
+	 (cl-incf error-count))))
+    (message "Import completed: %d added, %d skipped, %d errors"
+	     success-count skip-count error-count)))
+  
+
+
+(defun org-library-export (&optional format)
+  "Export library in specified FORMAT."
+  (interactive
+   (list (completing-read "Export format: " 
+                          (mapcar #'car org-library-export-functions) 
+                          nil t)))
+  (let* ((books (org-library--get-all-books))
+         (output-file (read-file-name "Export to: " nil nil nil
+                                      (format "library.%s" format)))
+	 (formatter (cdr (assoc format org-library-export-functions))))
+    (funcall formatter books output-file)
     (message "Library exported to %s" output-file)))
 
-;; === Metadata ===
-;; Metadata fetchers should return an alist of property-value pairs.
-;; Properties should be a member of 'org-library-supported-properties'.
-
-(defun org-library-fetch-openlibrary (isbn)
-  "Fetch book metadata from OpenLibrary API for ISBN."
-  (let* ((url (format "https://openlibrary.org/api/books?bibkeys=ISBN:%s&format=json&jscmd=data" isbn))
-	 (json-object-type 'alist)
-	 (json-array-type 'list)
-	 (json-key-type 'symbol)
-	 (json-response (with-current-buffer
-			    (url-retrieve-synchronously url)
-			  (goto-char url-http-end-of-headers)
-			  (json-read)))
-	 (book-data (alist-get (intern (format "ISBN:%s" isbn)) json-response)))
-    (when book-data
-      `((:title . ,(alist-get 'title book-data))
-	(:author . ,(mapconcat (lambda (author)
-				 (alist-get 'name author))
-			       (alist-get 'authors book-data) ", "))
-	(:year . ,(alist-get 'publish_date book-data))
-	(:publisher . ,(alist-get 'publishers book-data))))))
 
 ;; === Helpers ===
+
+(defun org-library--build-index ()
+  "Build an in-memory index of all books."
+  (setq org-library--index
+	(make-hash-table :test 'equal :size 1000))
+  (let ((books (org-library--get-all-books)))
+    (dolist (book books)
+      (puthash (alist-get :id book) book org-library--index))))
+
+(defun org-library--get-book-by-id (id)
+  "Get a book by its ID"
+  (unless org-library--index
+    (org-library--build-index))
+  (gethash id org-library--index))
+
+(defun org-library--add-book (book-data &optional skip-validation)
+  "Add a book to the library using BOOK-DATA alist.
+Required keys in BOOK-DATA are :title and optionally :isbn.
+If SKIP-VALIDATION it non-nil, bypass validation checks.
+Returns the book ID if successful, nil otherwise."
+  (let* ((title (alist-get :title book-data))
+	 (id (or (alist-get :id book-data)
+		 (funcall org-library-id-generator))))
+    ;; Ensure we have a title
+    (unless title
+      (error "Book data must include a title."))
+
+    ;; Add ID to book-data if not present
+    (unless (alist-get :id book-data)
+      (setq book-data (cons '(:id . ,id) book-data)))
+
+    ;; Validata unless skipping
+    (when (and (not skip-validation)
+	       (stringp (org-library--validate book-data)))
+      (if noninteractive
+	  (error "Validation failed for '%s'" title)
+	(message "Validation failed for '%s', skipping" title)
+	(setq id nil)))
+    ;; Only proceed if validation passed or was skipped
+    (when id
+      ;; Add the book
+      (with-current-buffer (find-file-noselect org-library-file)
+	(goto-char (point-max))
+	(insert (format "\n* %s\n" title))
+	(org-back-to-heading)
+	(org-insert-property-drawer)
+
+	;; Add ID
+	(org-set-property org-library-id-property id)
+
+	;; Add all properties from book-data
+	(dolist (prop book-data)
+	  (let ((prop-name (substring (symbol-name (car prop)) 1)))
+	    (unless (or (string= prop-name "title") ; Skip title, its the heading
+			(string= prop-name "id")) ; Already added the id
+	      (when (and (cdr prop) (not (string-empty-p (format "%s" (cdr prop)))))
+		(org-set-property (capitalize prop-name) (format "%s" (cdr prop)))))))
+
+	;; Add default properties not in book-data
+	(dolist (prop org-library-default-properties)
+	  (let ((prop-key (intern (concat ":" (downcase prop)))))
+	    (unless (alist-get prop-key book-data)
+	      (org-set-property prop "unknown"))))
+
+	(save-buffer)
+	(org-library--build-index)))
+    id))
 
 (defun org-library--get-all-books ()
   "Return a list of all books in the library.
@@ -285,7 +380,148 @@ Each book is represented as an alist of properties."
 	      (push (string-trim tag) tags))))))
     (seq-uniq tags)))
 
+(defun org-library--fetch-metadata (isbn &optional fetch-fn)
+  "Fetch book metadata for ISBN using FETCH-FN.
+If FETCH-FN is not provided, use 'org-library-fetch-metadata-function'."
+  (let ((metadata (funcall (or fetch-fn org-library-fetch-metadata-function) isbn)))
+    (if metadata
+	(message "Found %s by %s"
+		 (alist-get :title metadata)
+		 (alist-get :author metadata))
+      (message "No metadata found for ISBN %s" isbn))
+    metadata))
+
+;; === Validation ===
+
+(defun org-library--validate (book-data)
+  (let ((result t))
+    (catch 'validation-failed
+      (dolist (validator (symbol-value 'org-library-validation-hook))
+	(let ((validator-result (funcall validator book-data)))
+	  (when (stringp validator-result)
+	    ;; Failed validation with error message
+	    (setq result validator-result)
+	    (throw 'validation-failed nil)))))
+    ;; Check result and signal error if needed
+    (when (stringp result)
+      (user-error "Validation failed: %s" result))
+    t))
+
+(defun org-library--validate (book-data &optional interactive)
+  "Validata BOOK-DATA against all validation hooks.
+If INTERACTIVE is non-nil, show warnings for non-critical issues.
+Returns t if valid, or error message string if invalid."
+  (let ((critical-errors '())
+	(warnings '()))
+    ;; Run all validators
+    (dolist (validator (symbol-value 'org-library-validation-hook))
+      (let ((validator-result (funcall validator book-data)))
+	(when (stringp validator-result)
+	  ;; Check if this is a critical error
+	  (if (or (eq validator #'org-library--validate-required-properties)
+		  (eq validator #'org-library--validate-unique-isbn))
+	      (push validator-result critical-errors)
+	    (push validator-result warnings)))))
+    ;; Process results
+    (cond
+     ;; Critical errors -- always return error
+     (critical-errors
+      (car critical-errors))
+     ;; Warnings in interactive mode - prompt user
+     ((and warnings interactive)
+      (if (yes-or-no-p (format "Warning: %s. Add anyway? " (car warnings)))
+	  t ; User wants to proceed
+	(car warnings))) ; User cancelled
+     ;; Warnings in non-interactive mode - just proceed
+     (warnings
+      (message "Warning: %s" (car warnings))
+      t)
+     ;; No issues
+     (t t))))
+     
+  
+
+(defun org-library--validate-required-properties (book-data)
+  "Ensure all required properties exist in BOOK-DATA.
+Returns t if valid, or a string with error message if invalid."
+  (let ((missing nil))
+    (dolist (prop org-library-required-properties)
+      (let ((prop-key (intern (concat ":" (downcase prop)))))
+	(unless (and (alist-get prop-key book-data)
+		     (not (string-empty-p (format "%s" (alist-get prop-key book-data)))))
+	  (push prop missing))))
+    (if missing
+	(format "Missing required properties: %s" (mapconcat #'identity missing ", "))
+      t)))
+
+(defun org-library--validate-unique-isbn (book-data)
+  "Ensure ISBN is unique if provided.
+Returns t if valid, or a string with error message if invalid."
+  (let ((isbn (alist-get :isbn book-data))
+	(id (alist-get :id book-data)))
+    (message "%s" book-data)
+    (if (or (not isbn) (string-empty-p isbn))
+	t ; No ISBN, so validation passes
+      (let ((books (org-library--search "ISBN" isbn)))
+	(if (or (not books)
+		;; Its ok if the only match is this book (for updates)
+		(and (= (length books) 1)
+		     (string= (alist-get :id (car books)) (format "%s" id))))
+	      t
+	  (format "Book with ISBN %s already exists: %s"
+		  isbn (alist-get :title (car books))))))))
+
+(defun org-library--validate-unique-title-author (book-data)
+  "Check for likely duplicates based on title and author combination.
+Returns t if no duplicates found, or a string with warning if possible duplicates exist."
+  (let ((title (alist-get :title book-data))
+	(author (alist-get :author book-data))
+	(id (alist-get :id book-data)))
+    (when (and title author)
+      (let* ((title-matches (org-library--search "Title" title))
+	     (possible-dupes
+	      (seq-filter
+	       (lambda (book)
+		 (and (not (string= (alist-get :id book) (format "%s" id) )) ;; Not the same book
+		      (string-match-p (regexp-quote author) (or (alist-get :author book) ""))))
+	       title-matches)))
+	(if possible-dupes
+	    (format "Possible duplicate: \"%s\" by %s"
+		    (alist-get :title (car possible-dupes))
+		    (alist-get :author (car possible-dupes)))
+	  t)))))
+
+;; === Metadata ===
+;; Metadata fetchers should return an alist of property-value pairs.
+;; In general they should take a book's ISBN as an argument in the form of a string.
+;; Properties should be a member of 'org-library-supported-properties'.
+
+;; These will probably have to have the properties they fetch hardcoded in, simply because we have to parse a json response (in most cases)
+
+(defun org-library-fetch-openlibrary (isbn)
+  "Fetch book metadata from OpenLibrary API for ISBN."
+  (let* ((url (format "https://openlibrary.org/api/books?bibkeys=ISBN:%s&format=json&jscmd=data" isbn))
+	 (json-object-type 'alist)
+	 (json-array-type 'list)
+	 (json-key-type 'symbol)
+	 (json-response (with-current-buffer
+			    (url-retrieve-synchronously url)
+			  (goto-char url-http-end-of-headers)
+			  (json-read)))
+	 (book-data (alist-get (intern (format "ISBN:%s" isbn)) json-response)))
+    (when book-data
+      `((:title . ,(alist-get 'title book-data))
+	(:author . ,(mapconcat (lambda (author)
+				 (alist-get 'name author))
+			       (alist-get 'authors book-data) ", "))
+	(:year . ,(alist-get 'publish_date book-data))
+	(:publisher . ,(mapconcat (lambda (publisher)
+				    (alist-get 'name publisher))
+				  (alist-get 'publishers book-data) ", "))
+	))))
+
 ;; === Display Functions ===
+;; Display functions should take 'results', a list of book alists.
 
 (defun org-library--display-results-org (results)
   "Display search RESULTS in a buffer."
@@ -340,9 +576,32 @@ Each book is represented as an alist of properties."
         (tabulated-list-print t)))
     (display-buffer buffer)))
 
+;; === Export Functions ===
+;; Should take an alist of books, and an output file as arguments.
+;; Should add any extra export functions to the 'org-library-export-functions' list.
+
+;; Should update these later to export more dynamic fields.
+;; Perhaps a variable to define what fields to export?
+(defun org-library--export-csv (books output-file)
+  "Export BOOKS as CSV to OUTPUT-FILE."
+  (with-temp-file output-file
+    (insert "Title,Author,ISBN,Publisher,Year\n")
+    (dolist (book books)
+      (insert (format "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n"
+                      (alist-get :title book "")
+                      (alist-get :author book "")
+                      (alist-get :isbn book "")
+                      (alist-get :publisher book "")
+                      (alist-get :year book ""))))))
+
+(defun org-library--export-json (books output-file)
+  "Export BOOKS as JSON to OUTPUT-FILE."
+  (require 'json)
+  (with-temp-file output-file
+    (insert (json-encode books))))
+
+
 ;; TODO
-;;    1. Allow interactive display function selection with universal argument
-;;    2. Improve metadata fetching setup. Dedicated function to fetch metadata interactively
-;;    3. Allow interactive metadata function selection with universal argument for that interactive metadat function described above
-;;    4. Generalize the 'export' functionality. We should implement something similar to the metadata fetching, where we call a formatter function. I'm thinking we define an alist that maps from format name to formatter function, and allow the user to select from that list when calling the 'export' function.
+;;   1. CSV export currently hardcodes the fields to export. Should export all fields for a headline (probably too complicated to calculate csv headers if I do that, since different books can have different properties) or export a set of fields pre-defined in a variable (perhaps just use org-library-supported-properties, to export /everything/ even if value is null?)
+
 
